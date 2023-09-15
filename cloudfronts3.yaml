@@ -1,0 +1,147 @@
+# aws cloudformation create-stack --region=us-east-1 --stack-name YOUR_STACK_NAME --template-body file://YOUR_CONFIG_FILE --parameters ParameterKey=DomainName,ParameterValue=YOUR_HOST_FQDN ParameterKey=ZoneId,ParameterValue=YOUR_ZONE_ID
+# CloudFront Distribution の証明書が us-east-1 にないといけないので、
+# --region us-east-1 を指定
+
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  DomainName:
+    Type: String
+  ZoneId:
+    Type: String
+
+Resources:
+  ContentBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName:
+        Ref: DomainName
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  ContentBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref ContentBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowLegacyOAIReadOnly
+            Action:
+              - 's3:GetObject'
+            Effect: Allow
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref ContentBucket
+                - /*
+            Principal:
+              AWS: !Join ['', ['arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ', !GetAtt CFOAI.Id]]
+
+  LogBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Join ["", [Ref: DomainName, "-log"]]
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  CFOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Join [" ", ["CloudFront OAI for", !Ref DomainName]]
+
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-certificatemanager-certificate.html
+  AcmCertificate:
+    Type: AWS::CertificateManager::Certificate  
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      # automatically
+      # 設定しておかないと、いつまでも CREATE_IN_PROGRESS
+      # 強制終了させるにはスタックを削除？
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref ZoneId
+
+  # 末尾が / または 拡張子の無い名前の場合、自動的に index.html を付ける
+  AddIndexFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      AutoPublish: true
+      # https://docs.aws.amazon.com/ja_jp/AmazonCloudFront/latest/DeveloperGuide/example-function-add-index.html
+      FunctionCode: |
+        function handler(event) {
+            var request = event.request;
+            var uri = request.uri;
+
+            // Check whether the URI is missing a file name.
+            if (uri.endsWith('/')) {
+                request.uri += 'index.html';
+            }
+            // Check whether the URI is missing a file extension.
+            else if (!uri.includes('.')) {
+                request.uri += '/index.html';
+            }
+
+            return request;
+        }
+      FunctionConfig:
+        Comment: "Automatically add index.html"
+        Runtime: cloudfront-js-1.0
+      Name: AddIndex
+
+  CFDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - !Ref DomainName
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+        Origins:
+        - DomainName: !GetAtt ContentBucket.DomainName
+          Id: s3ContentBucket
+          S3OriginConfig:
+            OriginAccessIdentity: !Join ["", [ "origin-access-identity/cloudfront/", !GetAtt CFOAI.Id ]]
+        Enabled: 'true'
+        DefaultRootObject: index.html
+        Logging:
+          Bucket: !GetAtt LogBucket.DomainName
+        DefaultCacheBehavior:
+          ForwardedValues:
+            QueryString: true
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt AddIndexFunction.FunctionARN
+          TargetOriginId: s3ContentBucket
+          ViewerProtocolPolicy: allow-all
+        ViewerCertificate:
+          AcmCertificateArn: !Ref AcmCertificate
+          # 無いと、"Invalid request provided: IamCertificateId or AcmCertificateArn can be specified only if SslSupportMethod must also be specified and vice-versa." 
+          SslSupportMethod: sni-only
+
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-route53-recordset.html
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/quickref-route53.html#w4ab1c23c21c84c11
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref ZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CFDistribution.DomainName
+        EvaluateTargetHealth: false # can't set true on cloudfront distribution
+        HostedZoneId: Z2FDTNDATAQYW2 # always this value
+
+Outputs:
+  WebsiteURL:
+    Value: !GetAtt CFDistribution.DomainName
+    Description: URL for website hosted on S3
+  CloudFrontDistributionId:
+    Value: !Ref CFDistribution
+    Description: CloudFront Distribution ID
+
